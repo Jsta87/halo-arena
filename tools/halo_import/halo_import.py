@@ -368,6 +368,225 @@ def format_reference(tags: list[TagInstance], group: str, datum: int) -> str:
 
 
 
+
+def _sign_extend(value: int, bits: int) -> int:
+    sign = 1 << (bits - 1)
+    return (value ^ sign) - sign
+
+
+def unpack_halo_vector(packed: int) -> tuple[float, float, float]:
+    # Matches Halo CE Universal uncompress_int32_to_real_vector3d().
+    xi = _sign_extend(packed & 0x7FF, 11)
+    yj = _sign_extend((packed >> 11) & 0x7FF, 11)
+    zk = _sign_extend((packed >> 22) & 0x3FF, 10)
+
+    # Equivalent to the original bit-shift implementation.
+    x = (xi * 2.0 + 1.0) / 2047.0
+    y = (yj * 2.0 + 1.0) / 2047.0
+    z = (zk * 2.0 + 1.0) / 1023.0
+    return x, y, z
+
+
+def unpack_halo_texcoord(value: int) -> float:
+    signed = value if value < 0x8000 else value - 0x10000
+    return (signed * 2.0 + 1.0) / 65535.0
+
+
+def resolve_buffer_offset(address: int, cache: CacheHeader) -> int:
+    # Xbox model vertex buffers in cache files use file offsets, while
+    # triangle-buffer base addresses use tag-cache virtual addresses.
+    if CACHE_HEADER_SIZE <= address < cache.file_length:
+        return address
+    return ptr_to_file_offset(address, cache)
+
+
+def read_model_vertex(fp: BinaryIO, offset: int) -> dict:
+    fp.seek(offset)
+    raw = fp.read(0x20)
+    if len(raw) != 0x20:
+        raise HaloMapError(f"short compressed model vertex at 0x{offset:08X}")
+
+    x, y, z = struct.unpack_from("<3f", raw, 0x00)
+    normal = unpack_halo_vector(_u32(raw, 0x0C))
+    binormal = unpack_halo_vector(_u32(raw, 0x10))
+    tangent = unpack_halo_vector(_u32(raw, 0x14))
+    tu, tv = struct.unpack_from("<HH", raw, 0x18)
+    node0 = raw[0x1C] // 3
+    node1 = raw[0x1D] // 3
+    weight_raw = struct.unpack_from("<h", raw, 0x1E)[0]
+
+    return {
+        "position": (x, y, z),
+        "normal": normal,
+        "binormal": binormal,
+        "tangent": tangent,
+        "texcoord": (unpack_halo_texcoord(tu), unpack_halo_texcoord(tv)),
+        "nodes": (node0, node1),
+        "weight_raw": weight_raw,
+    }
+
+
+def strip_to_triangles(indices: list[int], vertex_count: int) -> list[tuple[int, int, int]]:
+    faces = []
+    for i in range(len(indices) - 2):
+        a, b, c = indices[i], indices[i + 1], indices[i + 2]
+
+        # Triangle strips flip winding every triangle.
+        if i & 1:
+            a, b = b, a
+
+        # Degenerate indices stitch strips together.
+        if a == b or b == c or a == c:
+            continue
+        if a >= vertex_count or b >= vertex_count or c >= vertex_count:
+            continue
+
+        faces.append((a, b, c))
+    return faces
+
+
+def export_model_obj(
+    fp: BinaryIO,
+    cache: CacheHeader,
+    tags: list[TagInstance],
+    biped_name: str,
+    output: Path,
+    geometry_index: int = 0,
+) -> None:
+    biped = find_tag(tags, biped_name, "bipd")
+    objdef = read_at_pointer(fp, cache, biped.base_address, 0x48)
+    _, model_index = parse_tag_reference(objdef, 0x28)
+    model_tag = tag_by_datum(tags, model_index)
+    if not model_tag or model_tag.group_tag != "mode":
+        raise HaloMapError("could not resolve biped model")
+
+    model = read_at_pointer(fp, cache, model_tag.base_address, 0xE8)
+    geometry_count, geometries_ptr = parse_tag_block(model, 0xD0)
+    shader_count, shaders_ptr = parse_tag_block(model, 0xDC)
+
+    if geometry_index < 0 or geometry_index >= geometry_count:
+        raise HaloMapError(
+            f"geometry index {geometry_index} outside 0..{geometry_count - 1}"
+        )
+
+    shader_names = []
+    if shader_count > 0:
+        shader_blob = read_at_pointer(fp, cache, shaders_ptr, shader_count * 0x20)
+        for si in range(shader_count):
+            row = shader_blob[si * 0x20 : (si + 1) * 0x20]
+            _, datum = parse_tag_reference(row, 0)
+            shader_tag = tag_by_datum(tags, datum)
+            shader_names.append(
+                shader_tag.name.replace("\\", "_") if shader_tag else f"shader_{si}"
+            )
+
+    geometries = read_at_pointer(fp, cache, geometries_ptr, geometry_count * 0x30)
+    grow = geometries[geometry_index * 0x30 : (geometry_index + 1) * 0x30]
+    part_count, parts_ptr = parse_tag_block(grow, 0x24)
+    if part_count <= 0:
+        raise HaloMapError(f"geometry {geometry_index} has no parts")
+
+    parts = read_at_pointer(fp, cache, parts_ptr, part_count * 0x68)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Halo Arena intermediate OBJ",
+        f"# source biped: {biped.name}",
+        f"# source model: {model_tag.name}",
+        f"# geometry LOD block: {geometry_index}",
+        "",
+    ]
+
+    vertex_base = 1
+    total_vertices = 0
+    total_faces = 0
+
+    for pi in range(part_count):
+        prow = parts[pi * 0x68 : (pi + 1) * 0x68]
+        shader_index = struct.unpack_from("<h", prow, 0x04)[0]
+
+        tb_type = struct.unpack_from("<h", prow, 0x44)[0]
+        triangle_count = _i32(prow, 0x48)
+        index_address = _u32(prow, 0x4C)
+
+        vb_type = struct.unpack_from("<h", prow, 0x54)[0]
+        vertex_count = _i32(prow, 0x58)
+        vertex_offset = _i32(prow, 0x5C)
+        vertex_address = _u32(prow, 0x60)
+
+        if vb_type != 5:
+            raise HaloMapError(
+                f"geometry {geometry_index} part {pi}: unsupported vertex type {vb_type}"
+            )
+        if tb_type != 1:
+            raise HaloMapError(
+                f"geometry {geometry_index} part {pi}: unsupported index type {tb_type}"
+            )
+
+        voff = resolve_buffer_offset(vertex_address, cache) + vertex_offset
+        ioff = resolve_buffer_offset(index_address, cache)
+
+        vertices = [
+            read_model_vertex(fp, voff + vi * 0x20)
+            for vi in range(vertex_count)
+        ]
+
+        # A strip containing N triangles has N+2 indices.
+        fp.seek(ioff)
+        raw_indices = fp.read((triangle_count + 2) * 2)
+        if len(raw_indices) != (triangle_count + 2) * 2:
+            raise HaloMapError(
+                f"short index buffer for geometry {geometry_index} part {pi}"
+            )
+        indices = list(struct.unpack("<" + "H" * (triangle_count + 2), raw_indices))
+        faces = strip_to_triangles(indices, vertex_count)
+
+        shader_name = (
+            shader_names[shader_index]
+            if 0 <= shader_index < len(shader_names)
+            else f"shader_{shader_index}"
+        )
+
+        lines.append(f"o geometry_{geometry_index}_part_{pi}")
+        lines.append(f"g {shader_name}")
+        lines.append(f"usemtl {shader_name}")
+
+        for v in vertices:
+            x, y, z = v["position"]
+            lines.append(f"v {x:.9g} {y:.9g} {z:.9g}")
+
+        for v in vertices:
+            u, vv = v["texcoord"]
+            # OBJ V origin is opposite the usual game-texture convention.
+            lines.append(f"vt {u:.9g} {1.0 - vv:.9g}")
+
+        for v in vertices:
+            nx, ny, nz = v["normal"]
+            lines.append(f"vn {nx:.9g} {ny:.9g} {nz:.9g}")
+
+        for a, b, c in faces:
+            aa = vertex_base + a
+            bb = vertex_base + b
+            cc = vertex_base + c
+            lines.append(
+                f"f {aa}/{aa}/{aa} {bb}/{bb}/{bb} {cc}/{cc}/{cc}"
+            )
+
+        vertex_base += vertex_count
+        total_vertices += vertex_count
+        total_faces += len(faces)
+        lines.append("")
+
+    output.write_text("\n".join(lines) + "\n")
+
+    print()
+    print(f"OBJ written:       {output}")
+    print(f"geometry:          {geometry_index}")
+    print(f"parts:             {part_count}")
+    print(f"vertices:          {total_vertices}")
+    print(f"faces:             {total_faces}")
+
+
 def inspect_model_geometry(
     fp: BinaryIO,
     cache: CacheHeader,
@@ -554,6 +773,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         metavar="TAG_NAME",
         help="follow a biped's model/animation references and summarize its model blocks",
     )
+    parser.add_argument(
+        "--export-obj",
+        metavar="PATH",
+        type=Path,
+        help="export the inspected biped model geometry as Wavefront OBJ",
+    )
+    parser.add_argument(
+        "--geometry",
+        type=int,
+        default=0,
+        help="model geometry/LOD block to export (default: 0, highest detail)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -575,6 +806,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             fp, _ = open_cache_image(args.map)
             with fp:
                 inspect_biped(fp, cache, tags, args.inspect_biped)
+
+            if args.export_obj:
+                fp, _ = open_cache_image(args.map)
+                with fp:
+                    export_model_obj(
+                        fp,
+                        cache,
+                        tags,
+                        args.inspect_biped,
+                        args.export_obj,
+                        args.geometry,
+                    )
         except HaloMapError as exc:
             print(f"halo_import: {exc}", file=sys.stderr)
             return 1
