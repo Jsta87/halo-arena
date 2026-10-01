@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import struct
 import sys
+import io
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Optional
@@ -113,6 +115,46 @@ def ptr_to_file_offset(ptr: int, header: CacheHeader) -> int:
             f"0x{TAG_CACHE_BASE:08X}..0x{TAG_CACHE_BASE + header.tag_data_size:08X}"
         )
     return header.tag_data_offset + rel
+
+
+def open_cache_image(path: Path) -> tuple[BinaryIO, bool]:
+    """
+    Return a seekable decompressed cache image.
+
+    Xbox disc maps keep the 0x800-byte cache header uncompressed and store
+    bytes after it as a zlib stream. The header offsets refer to the
+    decompressed image, not the physical compressed file.
+    """
+    raw = path.read_bytes()
+    if len(raw) < CACHE_HEADER_SIZE:
+        raise HaloMapError("file is smaller than the 0x800-byte Halo cache header")
+
+    # Read the expected decompressed size directly from the raw header.
+    expected_size = struct.unpack_from("<i", raw, 0x08)[0]
+
+    if expected_size <= 0:
+        raise HaloMapError(f"invalid cache size {expected_size}")
+
+    # A cached/decompressed map already has its declared size on disk.
+    if len(raw) >= expected_size:
+        return io.BytesIO(raw[:expected_size]), False
+
+    try:
+        payload = zlib.decompress(raw[CACHE_HEADER_SIZE:])
+    except zlib.error as exc:
+        raise HaloMapError(
+            f"map appears compressed ({len(raw):,} bytes on disk, "
+            f"{expected_size:,} bytes declared) but zlib decompression failed: {exc}"
+        ) from exc
+
+    image = raw[:CACHE_HEADER_SIZE] + payload
+    if len(image) < expected_size:
+        raise HaloMapError(
+            f"decompressed map is too short: got {len(image):,} bytes, "
+            f"expected {expected_size:,}"
+        )
+
+    return io.BytesIO(image[:expected_size]), True
 
 
 def read_cache_header(fp: BinaryIO) -> CacheHeader:
@@ -310,7 +352,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        with args.map.open("rb") as fp:
+        fp, was_compressed = open_cache_image(args.map)
+        with fp:
             cache = read_cache_header(fp)
             tags_header = read_tag_header(fp, cache)
             tags = read_tags(fp, cache, tags_header)
@@ -319,6 +362,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     print_header(args.map, cache, tags_header)
+    print(f"source format:     {'Xbox zlib-compressed' if was_compressed else 'uncompressed cache'}")
+    print()
 
     needle = args.find.lower() if args.find else None
     wanted_class = args.tag_class.lower() if args.tag_class else None
