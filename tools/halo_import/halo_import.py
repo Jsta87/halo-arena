@@ -367,6 +367,93 @@ def format_reference(tags: list[TagInstance], group: str, datum: int) -> str:
     return f"{group} 0x{datum:08X}  <unresolved>"
 
 
+
+def inspect_model_geometry(
+    fp: BinaryIO,
+    cache: CacheHeader,
+    tags: list[TagInstance],
+    model_tag: TagInstance,
+) -> None:
+    model = read_at_pointer(fp, cache, model_tag.base_address, 0xE8)
+    geometry_count, geometries_ptr = parse_tag_block(model, 0xD0)
+    shader_count, shaders_ptr = parse_tag_block(model, 0xDC)
+
+    print()
+    print("geometry detail:")
+    print(f"  geometry blocks: {geometry_count}")
+    print(f"  shader refs:     {shader_count}")
+
+    # model_shader_reference is 0x20 bytes; tag_reference begins at +0.
+    if shader_count > 0 and shaders_ptr:
+        shader_blob = read_at_pointer(fp, cache, shaders_ptr, shader_count * 0x20)
+        for si in range(shader_count):
+            row = shader_blob[si * 0x20 : (si + 1) * 0x20]
+            group, datum = parse_tag_reference(row, 0)
+            perm = struct.unpack_from("<h", row, 0x10)[0]
+            print(
+                f"  shader[{si}]:      {format_reference(tags, group, datum)} "
+                f"perm={perm}"
+            )
+
+    if geometry_count <= 0 or not geometries_ptr:
+        return
+
+    # struct model_geometry = reserved[0x24] + tag_block parts = 0x30.
+    geometries = read_at_pointer(fp, cache, geometries_ptr, geometry_count * 0x30)
+
+    for gi in range(geometry_count):
+        grow = geometries[gi * 0x30 : (gi + 1) * 0x30]
+        part_count, parts_ptr = parse_tag_block(grow, 0x24)
+        print()
+        print(f"  geometry[{gi}]: parts={part_count} addr=0x{parts_ptr:08X}")
+
+        if part_count <= 0 or not parts_ptr:
+            continue
+
+        # models.c verifies sizeof(model_geometry_part) == 0x68.
+        parts = read_at_pointer(fp, cache, parts_ptr, part_count * 0x68)
+
+        for pi in range(part_count):
+            prow = parts[pi * 0x68 : (pi + 1) * 0x68]
+
+            flags = _u32(prow, 0x00)
+            shader_index = struct.unpack_from("<h", prow, 0x04)[0]
+
+            uv_count, uv_ptr = parse_tag_block(prow, 0x20)
+            cv_count, cv_ptr = parse_tag_block(prow, 0x2C)
+            tri_count, tri_ptr = parse_tag_block(prow, 0x38)
+
+            # triangle_buffer @ 0x44, sizeof 0x10
+            tb_type = struct.unpack_from("<h", prow, 0x44)[0]
+            tb_count = _i32(prow, 0x48)
+            tb_base = _u32(prow, 0x4C)
+            tb_hw = _u32(prow, 0x50)
+
+            # vertex_buffer @ 0x54, sizeof 0x14
+            vb_type = struct.unpack_from("<h", prow, 0x54)[0]
+            vb_count = _i32(prow, 0x58)
+            vb_offset = _i32(prow, 0x5C)
+            vb_base = _u32(prow, 0x60)
+            vb_hw = _u32(prow, 0x64)
+
+            print(
+                f"    part[{pi}]: shader={shader_index} flags=0x{flags:08X} "
+                f"uverts={uv_count} cverts={cv_count} tris={tri_count}"
+            )
+            print(
+                f"             compressed=0x{cv_ptr:08X} "
+                f"triangles=0x{tri_ptr:08X}"
+            )
+            print(
+                f"             VB type={vb_type} count={vb_count} "
+                f"offset={vb_offset} base=0x{vb_base:08X} hw=0x{vb_hw:08X}"
+            )
+            print(
+                f"             IB type={tb_type} count={tb_count} "
+                f"base=0x{tb_base:08X} hw=0x{tb_hw:08X}"
+            )
+
+
 def inspect_biped(
     fp: BinaryIO,
     cache: CacheHeader,
@@ -420,6 +507,8 @@ def inspect_biped(
             f"{label + ':':17s}{count:5d}  "
             f"addr=0x{address:08X}  {translated}"
         )
+
+    inspect_model_geometry(fp, cache, tags, model_tag)
 
 
 def print_header(path: Path, cache: CacheHeader, tags: TagHeader) -> None:
