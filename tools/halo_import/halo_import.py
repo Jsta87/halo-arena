@@ -311,6 +311,117 @@ def read_tags(
     return result
 
 
+
+def find_tag(tags: list[TagInstance], name: str, tag_class: Optional[str] = None) -> TagInstance:
+    wanted = name.lower().replace("/", "\\")
+    for tag in tags:
+        if tag.name.lower() == wanted and (tag_class is None or tag.group_tag.lower() == tag_class.lower()):
+            return tag
+    raise HaloMapError(
+        f"tag not found: {name}" + (f" ({tag_class})" if tag_class else "")
+    )
+
+
+def read_at_pointer(fp: BinaryIO, cache: CacheHeader, ptr: int, size: int) -> bytes:
+    off = ptr_to_file_offset(ptr, cache)
+    fp.seek(off)
+    data = fp.read(size)
+    if len(data) != size:
+        raise HaloMapError(
+            f"short read at cache pointer 0x{ptr:08X}: got {len(data)}, expected {size}"
+        )
+    return data
+
+
+def parse_tag_reference(data: bytes, offset: int = 0) -> tuple[str, int]:
+    if offset < 0 or offset + 16 > len(data):
+        raise HaloMapError("tag reference lies outside supplied data")
+    group = _fourcc(data[offset : offset + 4])
+    index = _u32(data, offset + 12)
+    return group, index
+
+
+def parse_tag_block(data: bytes, offset: int) -> tuple[int, int]:
+    if offset < 0 or offset + 12 > len(data):
+        raise HaloMapError("tag block lies outside supplied data")
+    count = _i32(data, offset)
+    address = _u32(data, offset + 4)
+    return count, address
+
+
+def tag_by_datum(tags: list[TagInstance], datum: int) -> Optional[TagInstance]:
+    absolute = datum & 0xFFFF
+    if 0 <= absolute < len(tags):
+        candidate = tags[absolute]
+        if candidate.tag_index == datum or (candidate.tag_index & 0xFFFF) == absolute:
+            return candidate
+    return None
+
+
+def format_reference(tags: list[TagInstance], group: str, datum: int) -> str:
+    if datum == 0xFFFFFFFF:
+        return f"{group} NONE"
+    tag = tag_by_datum(tags, datum)
+    if tag:
+        return f"{group} 0x{datum:08X}  {tag.name}"
+    return f"{group} 0x{datum:08X}  <unresolved>"
+
+
+def inspect_biped(
+    fp: BinaryIO,
+    cache: CacheHeader,
+    tags: list[TagInstance],
+    name: str,
+) -> None:
+    biped = find_tag(tags, name, "bipd")
+
+    # _object_definition begins the biped definition.
+    # model is at offset 0x28; animation_graph follows at 0x38.
+    obj = read_at_pointer(fp, cache, biped.base_address, 0x48)
+    model_group, model_index = parse_tag_reference(obj, 0x28)
+    anim_group, anim_index = parse_tag_reference(obj, 0x38)
+
+    print(f"biped:            0x{biped.tag_index:08X}  {biped.name}")
+    print(f"model ref:        {format_reference(tags, model_group, model_index)}")
+    print(f"animation ref:    {format_reference(tags, anim_group, anim_index)}")
+
+    model_tag = tag_by_datum(tags, model_index)
+    if not model_tag:
+        raise HaloMapError(f"could not resolve model datum 0x{model_index:08X}")
+    if model_tag.group_tag != "mode":
+        raise HaloMapError(
+            f"biped model points to {model_tag.group_tag}, expected mode"
+        )
+
+    # struct model is 0xE8 bytes. Its five trailing tag_block fields start:
+    # markers 0xAC, nodes 0xB8, regions 0xC4, geometries 0xD0, shaders 0xDC.
+    model = read_at_pointer(fp, cache, model_tag.base_address, 0xE8)
+
+    blocks = [
+        ("markers", 0xAC),
+        ("nodes", 0xB8),
+        ("regions", 0xC4),
+        ("geometries", 0xD0),
+        ("shaders", 0xDC),
+    ]
+
+    print(f"model tag:        0x{model_tag.tag_index:08X}  {model_tag.name}")
+    print(f"model data:       0x{model_tag.base_address:08X}")
+
+    for label, offset in blocks:
+        count, address = parse_tag_block(model, offset)
+        translated = "-"
+        if count > 0 and address:
+            try:
+                translated = f"file+0x{ptr_to_file_offset(address, cache):08X}"
+            except HaloMapError:
+                translated = "<outside tag cache>"
+        print(
+            f"{label + ':':17s}{count:5d}  "
+            f"addr=0x{address:08X}  {translated}"
+        )
+
+
 def print_header(path: Path, cache: CacheHeader, tags: TagHeader) -> None:
     print(f"file:             {path}")
     print(f"map name:         {cache.name}")
@@ -349,6 +460,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=0,
         help="maximum number of matching tags to print (0 = all)",
     )
+    parser.add_argument(
+        "--inspect-biped",
+        metavar="TAG_NAME",
+        help="follow a biped's model/animation references and summarize its model blocks",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -364,6 +480,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     print_header(args.map, cache, tags_header)
     print(f"source format:     {'Xbox zlib-compressed' if was_compressed else 'uncompressed cache'}")
     print()
+
+    if args.inspect_biped:
+        try:
+            fp, _ = open_cache_image(args.map)
+            with fp:
+                inspect_biped(fp, cache, tags, args.inspect_biped)
+        except HaloMapError as exc:
+            print(f"halo_import: {exc}", file=sys.stderr)
+            return 1
+        return 0
 
     needle = args.find.lower() if args.find else None
     wanted_class = args.tag_class.lower() if args.tag_class else None
