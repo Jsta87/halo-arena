@@ -1,0 +1,11 @@
+build/
+cmake-build-*/
+halo_import_out/
+basehalo/
+*.pk3
+
+# Local Halo CE data
+maps/
+halo-ce-data/
+*.iso
+*.xiso
