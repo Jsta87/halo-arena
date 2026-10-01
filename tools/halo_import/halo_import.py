@@ -392,12 +392,34 @@ def unpack_halo_texcoord(value: int) -> float:
     return (signed * 2.0 + 1.0) / 65535.0
 
 
-def resolve_buffer_offset(address: int, cache: CacheHeader) -> int:
-    # Xbox model vertex buffers in cache files use file offsets, while
-    # triangle-buffer base addresses use tag-cache virtual addresses.
-    if CACHE_HEADER_SIZE <= address < cache.file_length:
-        return address
-    return ptr_to_file_offset(address, cache)
+def read_d3d_resource(fp: BinaryIO, cache: CacheHeader, ptr: int) -> tuple[int, int, int]:
+    """
+    Read the 12-byte Xbox D3DResource prefix used by vertex/index buffers.
+
+    Halo CE Universal's Linux port treats these as:
+      DWORD Common;
+      DWORD Data;
+      DWORD Lock;
+    """
+    raw = read_at_pointer(fp, cache, ptr, 12)
+    return struct.unpack("<III", raw)
+
+
+def vertex_resource_data_to_file_offset(data: int, cache: CacheHeader) -> int:
+    """
+    Cached Xbox vertex-buffer Data is a physical address. Halo CE Universal
+    maps physical P at virtual 0x80000000|P, then reads it from the tag cache.
+    """
+    virtual = data | 0x80000000
+    return ptr_to_file_offset(virtual, cache)
+
+
+def index_resource_data_to_file_offset(data: int, cache: CacheHeader) -> int:
+    """
+    Xbox index-buffer Data is an ordinary virtual address, per xdk_d3d8.h
+    and the Linux D3D8 resource implementation.
+    """
+    return ptr_to_file_offset(data, cache)
 
 
 def read_model_vertex(fp: BinaryIO, offset: int) -> dict:
@@ -533,11 +555,13 @@ def export_model_obj(
         tb_type = struct.unpack_from("<h", prow, 0x44)[0]
         triangle_count = _i32(prow, 0x48)
         index_address = _u32(prow, 0x4C)
+        index_resource_ptr = _u32(prow, 0x50)
 
         vb_type = struct.unpack_from("<h", prow, 0x54)[0]
         vertex_count = _i32(prow, 0x58)
         vertex_offset = _i32(prow, 0x5C)
         vertex_address = _u32(prow, 0x60)
+        vertex_resource_ptr = _u32(prow, 0x64)
 
         if vb_type != 5:
             raise HaloMapError(
@@ -548,8 +572,30 @@ def export_model_obj(
                 f"geometry {geometry_index} part {pi}: unsupported index type {tb_type}"
             )
 
-        voff = resolve_buffer_offset(vertex_address, cache) + vertex_offset
-        ioff = resolve_buffer_offset(index_address, cache)
+        vb_common, vb_data, vb_lock = read_d3d_resource(
+            fp, cache, vertex_resource_ptr
+        )
+        ib_common, ib_data, ib_lock = read_d3d_resource(
+            fp, cache, index_resource_ptr
+        )
+
+        voff = vertex_resource_data_to_file_offset(vb_data, cache) + vertex_offset
+        ioff = index_resource_data_to_file_offset(ib_data, cache)
+
+        # Keep the part fields as diagnostics only. Halo CE Universal's
+        # renderer ultimately consumes the D3D resource Data fields.
+        print(
+            f"resource part[{pi}]: "
+            f"VB desc=0x{vertex_resource_ptr:08X} data=0x{vb_data:08X} "
+            f"-> file+0x{voff:08X}; "
+            f"IB desc=0x{index_resource_ptr:08X} data=0x{ib_data:08X} "
+            f"-> file+0x{ioff:08X}"
+        )
+        print(
+            f"                  part hints: "
+            f"VB base=0x{vertex_address:08X} "
+            f"IB base=0x{index_address:08X}"
+        )
 
         vertices = [
             read_model_vertex(fp, voff + vi * 0x20)
