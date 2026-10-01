@@ -426,23 +426,48 @@ def read_model_vertex(fp: BinaryIO, offset: int) -> dict:
     }
 
 
-def strip_to_triangles(indices: list[int], vertex_count: int) -> list[tuple[int, int, int]]:
-    faces = []
-    for i in range(len(indices) - 2):
-        a, b, c = indices[i], indices[i + 1], indices[i + 2]
+def strip_to_triangles(
+    indices: list[int], vertex_count: int
+) -> tuple[list[tuple[int, int, int]], int, int]:
+    """
+    Convert Xbox precompiled triangle strips to ordinary triangles.
 
-        # Triangle strips flip winding every triangle.
-        if i & 1:
-            a, b = b, a
+    0xFFFF is treated as a strip-restart/control index. Degenerate triangles
+    are skipped, and winding parity restarts for each independent strip.
+    """
+    faces: list[tuple[int, int, int]] = []
+    restart_count = 0
+    out_of_range = 0
 
-        # Degenerate indices stitch strips together.
-        if a == b or b == c or a == c:
+    strip: list[int] = []
+
+    def flush_strip() -> None:
+        nonlocal out_of_range
+        for i in range(len(strip) - 2):
+            a, b, c = strip[i], strip[i + 1], strip[i + 2]
+
+            if i & 1:
+                a, b = b, a
+
+            if a == b or b == c or a == c:
+                continue
+
+            if a >= vertex_count or b >= vertex_count or c >= vertex_count:
+                out_of_range += 1
+                continue
+
+            faces.append((a, b, c))
+
+    for index in indices:
+        if index == 0xFFFF:
+            restart_count += 1
+            flush_strip()
+            strip = []
             continue
-        if a >= vertex_count or b >= vertex_count or c >= vertex_count:
-            continue
+        strip.append(index)
 
-        faces.append((a, b, c))
-    return faces
+    flush_strip()
+    return faces, restart_count, out_of_range
 
 
 def export_model_obj(
@@ -539,7 +564,18 @@ def export_model_obj(
                 f"short index buffer for geometry {geometry_index} part {pi}"
             )
         indices = list(struct.unpack("<" + "H" * (triangle_count + 2), raw_indices))
-        faces = strip_to_triangles(indices, vertex_count)
+        faces, restart_count, out_of_range = strip_to_triangles(indices, vertex_count)
+
+        valid_indices = [i for i in indices if i != 0xFFFF]
+        min_index = min(valid_indices) if valid_indices else -1
+        max_index = max(valid_indices) if valid_indices else -1
+
+        print(
+            f"export part[{pi}]: verts={vertex_count} strip_tris={triangle_count} "
+            f"indices={len(indices)} restarts={restart_count} "
+            f"index_range={min_index}..{max_index} "
+            f"out_of_range_windows={out_of_range} faces={len(faces)}"
+        )
 
         shader_name = (
             shader_names[shader_index]
