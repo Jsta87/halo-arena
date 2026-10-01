@@ -73,17 +73,17 @@ replace_once(
 for name in ("g_active.c", "g_client.c", "g_combat.c"):
     ensure_include(root / "code/game" / name, '#include "g_halo_shield.h"')
 
-# Spawn reset
+# Spawn reset: place it after final health initialization so the value survives
+# the ClientSpawn player-state reset and is published at full charge.
 p = root / "code/game/g_client.c"
 data = p.read_text()
-if "Halo_ShieldReset( ent );" not in data:
-    anchor = "\tclient->ps.stats[STAT_MAX_HEALTH] = client->pers.maxHealth;\n"
-    if anchor not in data:
-        raise SystemExit("[fail] ClientSpawn anchor not found")
-    p.write_text(data.replace(anchor, anchor + "\n\tHalo_ShieldReset( ent );\n", 1))
-    print("[ok] reset shield in ClientSpawn")
-else:
-    print("[skip] ClientSpawn shield reset already present")
+data = data.replace("\n\tHalo_ShieldReset( ent );\n", "\n")
+anchor = "\tent->health = client->ps.stats[STAT_HEALTH] = client->ps.stats[STAT_MAX_HEALTH] + 25;\n"
+if anchor not in data:
+    raise SystemExit("[fail] final ClientSpawn health anchor not found")
+data = data.replace(anchor, anchor + "\n\tHalo_ShieldReset( ent );\n", 1)
+p.write_text(data)
+print("[ok] reset shield after final spawn health initialization")
 
 # Damage hook
 p = root / "code/game/g_combat.c"
