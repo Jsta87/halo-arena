@@ -28,9 +28,9 @@ CACHE_HEADER_SIZE = 0x800
 TAG_CACHE_BASE = 0x803A6000
 CACHE_VERSION_XBOX = 5
 
-HEADER_SIG = b"head"
-FOOTER_SIG = b"foot"
-TAG_HEADER_SIG = b"tags"
+HEADER_SIG = b"daeh"
+FOOTER_SIG = b"toof"
+TAG_HEADER_SIG = b"sgat"
 
 TAG_HEADER_SIZE = 0x24
 TAG_INSTANCE_SIZE = 0x20
@@ -89,9 +89,10 @@ def _cstring(raw: bytes) -> str:
 
 
 def _fourcc(raw: bytes) -> str:
-    # Halo tag classes are stored as four bytes that read naturally in-file
-    # on the little-endian Xbox cache.
-    return raw.decode("latin-1", errors="replace")
+    # Halo tag classes are 32-bit multi-character constants. On the
+    # little-endian Xbox cache they appear byte-reversed on disk:
+    # 'mode' -> b'edom', 'bipd' -> b'dpib', etc.
+    return raw[::-1].decode("latin-1", errors="replace")
 
 
 def _u32(data: bytes, offset: int) -> int:
