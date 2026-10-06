@@ -2,9 +2,9 @@
 """Attach Halo CE model base textures to an OBJ exported by halo_import.py.
 
 Texture extraction mirrors Halo CE Universal's cache/resource-map layouts.
-For bitmap_data with the in-resource-map flag, bitmaps.map is resolved by
-its own resource index using the '<tag>__pixels' entry, rather than treating
-scenario-relative offsets as raw offsets into bitmaps.map.
+For external bitmap tags, bitmaps.map stores both the bitmap tag body itself
+and a separate '<tag>__pixels' resource item. Internal block addresses inside
+the external bitmap tag body are relative to that resource item.
 """
 
 from __future__ import annotations
@@ -29,7 +29,11 @@ def safe_name(name: str) -> str:
 
 
 def dds_fourcc(fmt: int) -> bytes:
-    return {BITMAP_FORMAT_DXT1: b"DXT1", BITMAP_FORMAT_DXT3: b"DXT3", BITMAP_FORMAT_DXT5: b"DXT5"}[fmt]
+    return {
+        BITMAP_FORMAT_DXT1: b"DXT1",
+        BITMAP_FORMAT_DXT3: b"DXT3",
+        BITMAP_FORMAT_DXT5: b"DXT5",
+    }[fmt]
 
 
 def dxt_top_size(width: int, height: int, fmt: int) -> int:
@@ -76,6 +80,7 @@ def resource_map_items(path: Path) -> dict[str, tuple[int, int]]:
         index = fp.read(count * 12)
         if len(index) != count * 12:
             raise hi.HaloMapError(f"short resource-map index: {path}")
+
         result = {}
         for i in range(count):
             name_rel, size, data_offset = struct.unpack_from("<iii", index, i * 12)
@@ -84,20 +89,95 @@ def resource_map_items(path: Path) -> dict[str, tuple[int, int]]:
         return result
 
 
-def read_bitmap_preview(scenario_fp, cache, bitmap_tag, bitmaps_map: Path, resource_items):
-    group = hi.read_at_pointer(scenario_fp, cache, bitmap_tag.base_address, 0x6C)
-    pixel_data_file_offset = hi._i32(group, 0x38)
-    bitmap_count, bitmap_ptr = hi.parse_tag_block(group, 0x60)
-    if bitmap_count <= 0 or not bitmap_ptr:
-        raise hi.HaloMapError(f"bitmap tag has no bitmap_data entries: {bitmap_tag.name}")
+def parse_external_bitmap_metadata(bitmaps_map: Path, item_offset: int, item_size: int):
+    """Parse a bitm resource-map item whose internal addresses are item-relative."""
+    with bitmaps_map.open("rb") as fp:
+        fp.seek(item_offset)
+        item = fp.read(item_size)
 
-    data = hi.read_at_pointer(scenario_fp, cache, bitmap_ptr, 0x30)
+    if len(item) < 0x6C:
+        raise hi.HaloMapError("external bitmap resource item is too small")
+
+    bitmap_count = struct.unpack_from("<i", item, 0x60)[0]
+    bitmap_rel = struct.unpack_from("<I", item, 0x64)[0]
+    if bitmap_count <= 0:
+        raise hi.HaloMapError("external bitmap resource has no bitmap_data entries")
+    if bitmap_rel + 0x30 > len(item):
+        raise hi.HaloMapError(
+            f"external bitmap_data offset 0x{bitmap_rel:X} outside resource item"
+        )
+
+    data = item[bitmap_rel:bitmap_rel + 0x30]
     width = struct.unpack_from("<h", data, 0x04)[0]
     height = struct.unpack_from("<h", data, 0x06)[0]
     fmt = struct.unpack_from("<h", data, 0x0C)[0]
     flags = struct.unpack_from("<H", data, 0x0E)[0]
-    pixels_offset = hi._i32(data, 0x18)
-    pixels_size = hi._i32(data, 0x1C)
+    pixels_offset = struct.unpack_from("<i", data, 0x18)[0]
+    pixels_size = struct.unpack_from("<i", data, 0x1C)[0]
+    return width, height, fmt, flags, pixels_offset, pixels_size
+
+
+def read_bitmap_preview(scenario_fp, cache, bitmap_tag, bitmaps_map: Path, resource_items):
+    # External bitmaps are special: the scenario cache contains a stub tag,
+    # while bitmaps.map contains the real bitmap tag body and pixel item.
+    external_meta_item = resource_items.get(bitmap_tag.name.lower())
+    pixel_item = resource_items.get((bitmap_tag.name + "__pixels").lower())
+
+    if external_meta_item and pixel_item:
+        meta_offset, meta_size = external_meta_item
+        width, height, fmt, flags, pixels_offset, pixels_size = parse_external_bitmap_metadata(
+            bitmaps_map, meta_offset, meta_size
+        )
+
+        pixel_offset, pixel_item_size = pixel_item
+        top_size = dxt_top_size(width, height, fmt)
+        if top_size > pixel_item_size:
+            raise hi.HaloMapError(
+                f"top mip needs {top_size} bytes, pixel resource only has {pixel_item_size}"
+            )
+
+        with bitmaps_map.open("rb") as fp:
+            fp.seek(pixel_offset)
+            payload = fp.read(top_size)
+
+        source = bitmaps_map.name
+        source_note = (
+            f"metadata resource {bitmap_tag.name}; "
+            f"pixels resource {bitmap_tag.name}__pixels"
+        )
+        final_offset = pixel_offset
+    else:
+        group = hi.read_at_pointer(scenario_fp, cache, bitmap_tag.base_address, 0x6C)
+        pixel_data_file_offset = hi._i32(group, 0x38)
+        bitmap_count, bitmap_ptr = hi.parse_tag_block(group, 0x60)
+        if bitmap_count <= 0 or not bitmap_ptr:
+            raise hi.HaloMapError(f"bitmap tag has no bitmap_data entries: {bitmap_tag.name}")
+
+        data = hi.read_at_pointer(scenario_fp, cache, bitmap_ptr, 0x30)
+        width = struct.unpack_from("<h", data, 0x04)[0]
+        height = struct.unpack_from("<h", data, 0x06)[0]
+        fmt = struct.unpack_from("<h", data, 0x0C)[0]
+        flags = struct.unpack_from("<H", data, 0x0E)[0]
+        pixels_offset = hi._i32(data, 0x18)
+        pixels_size = hi._i32(data, 0x1C)
+
+        top_size = dxt_top_size(width, height, fmt)
+
+        if flags & BITMAP_DATA_IN_RESOURCE_MAP_BIT:
+            if not bitmaps_map.exists():
+                raise hi.HaloMapError(f"{bitmap_tag.name} needs {bitmaps_map}")
+            final_offset = pixels_offset
+            with bitmaps_map.open("rb") as fp:
+                fp.seek(final_offset)
+                payload = fp.read(top_size)
+            source = bitmaps_map.name
+            source_note = "bitmap_data pixels_offset fallback"
+        else:
+            final_offset = pixel_data_file_offset + pixels_offset
+            scenario_fp.seek(final_offset)
+            payload = scenario_fp.read(top_size)
+            source = "scenario map"
+            source_note = "group pixel_data + bitmap pixels_offset"
 
     if fmt not in (BITMAP_FORMAT_DXT1, BITMAP_FORMAT_DXT3, BITMAP_FORMAT_DXT5):
         raise hi.HaloMapError(f"unsupported preview bitmap format {fmt}: {bitmap_tag.name}")
@@ -105,41 +185,13 @@ def read_bitmap_preview(scenario_fp, cache, bitmap_tag, bitmaps_map: Path, resou
         raise hi.HaloMapError(f"invalid bitmap dimensions {width}x{height}: {bitmap_tag.name}")
 
     top_size = dxt_top_size(width, height, fmt)
-
-    if flags & BITMAP_DATA_IN_RESOURCE_MAP_BIT:
-        if not bitmaps_map.exists():
-            raise hi.HaloMapError(f"{bitmap_tag.name} needs {bitmaps_map}")
-
-        pixel_item_name = (bitmap_tag.name + "__pixels").lower()
-        item = resource_items.get(pixel_item_name)
-        if item:
-            data_offset, item_size = item
-            final_offset = data_offset
-            source_note = f"resource item {bitmap_tag.name}__pixels"
-        else:
-            # Stock Xbox maps commonly store pixels_offset as an absolute
-            # offset into bitmaps.map. Do not add the scenario tag_data
-            # pixel_data.file_offset here; that was the old bug.
-            final_offset = pixels_offset
-            item_size = pixels_size
-            source_note = "bitmap_data pixels_offset"
-
-        with bitmaps_map.open("rb") as fp:
-            fp.seek(final_offset)
-            payload = fp.read(top_size)
-        source = bitmaps_map.name
-    else:
-        final_offset = pixel_data_file_offset + pixels_offset
-        scenario_fp.seek(final_offset)
-        payload = scenario_fp.read(top_size)
-        source = "scenario map"
-        source_note = "group pixel_data + bitmap pixels_offset"
-
     if len(payload) != top_size:
         raise hi.HaloMapError(
             f"short bitmap read for {bitmap_tag.name}: got {len(payload)}, expected {top_size}"
         )
 
+    # Halo CE Universal's Linux texture path explicitly treats DXT as plain
+    # 4x4 blocks, so do NOT swizzle/unswizzle compressed textures here.
     print(
         f"texture: {bitmap_tag.name} {width}x{height} fmt={fmt} flags=0x{flags:04X} "
         f"source={source} offset=0x{final_offset:X} ({source_note}) bytes={top_size}"
@@ -166,6 +218,7 @@ def collect_model_shaders(fp, cache, tags, biped_name: str):
     model = hi.read_at_pointer(fp, cache, model_tag.base_address, 0xE8)
     shader_count, shaders_ptr = hi.parse_tag_block(model, 0xDC)
     blob = hi.read_at_pointer(fp, cache, shaders_ptr, shader_count * 0x20)
+
     out = []
     for i in range(shader_count):
         _, datum = hi.parse_tag_reference(blob[i * 0x20:(i + 1) * 0x20], 0)
@@ -211,6 +264,7 @@ def main() -> int:
                         print(f"wrote:   {out_dir / texture_file}")
                     except hi.HaloMapError as exc:
                         print(f"warning: could not export {shader.name}: {exc}")
+
                 materials.append((material_name, shader.group_tag, texture_file))
 
         mtl_lines = ["# Halo Arena preview materials", ""]
@@ -227,15 +281,21 @@ def main() -> int:
             mtl_lines.append("")
 
         mtl_path.write_text("\n".join(mtl_lines) + "\n")
-        lines = [line for line in args.obj.read_text().splitlines() if not line.startswith("mtllib ")]
+
+        lines = [
+            line for line in args.obj.read_text().splitlines()
+            if not line.startswith("mtllib ")
+        ]
         insert_at = 0
         while insert_at < len(lines) and lines[insert_at].startswith("#"):
             insert_at += 1
         lines.insert(insert_at, f"mtllib {mtl_path.name}")
         args.obj.write_text("\n".join(lines) + "\n")
+
         print(f"wrote:   {mtl_path}")
         print(f"updated: {args.obj}")
         return 0
+
     except (OSError, hi.HaloMapError, KeyError) as exc:
         print(f"texture_obj: {exc}", file=sys.stderr)
         return 1
