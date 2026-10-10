@@ -50,7 +50,17 @@ jobs:
               cd /src
               python3 /opence_rpi_patch.py
               python3 configure.py --release --pgo=off --lto=off --linux-cc=clang
-              ninja -v linux
+
+              # Preserve the complete compiler output even when Ninja fails.
+              set +e
+              ninja -v linux 2>&1 | tee /out/build.log
+              build_status=${PIPESTATUS[0]}
+              set -e
+              if [ "$build_status" -ne 0 ]; then
+                echo "===== OpenCE build failed; last 400 log lines ====="
+                tail -n 400 /out/build.log
+                exit "$build_status"
+              fi
 
               mkdir -p /out/OpenCE-RaspberryPi-armhf/lib
               cp build/linux/halo build/linux/brokers.txt build/linux/map_validate /out/OpenCE-RaspberryPi-armhf/
@@ -99,6 +109,15 @@ jobs:
               cd /out
               zip -qr OpenCE-RaspberryPi-armhf.zip OpenCE-RaspberryPi-armhf
             '
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCE-RaspberryPi-armhf-build-log
+          path: out/build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload package
         uses: actions/upload-artifact@v4
