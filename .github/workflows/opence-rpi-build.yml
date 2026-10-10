@@ -1,4 +1,4 @@
-name: OpenCE Raspberry Pi AArch64 build
+name: OpenCE Raspberry Pi armhf build
 
 on:
   push:
@@ -10,18 +10,23 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build OpenCE for Raspberry Pi OS 64-bit
+      - name: Enable ARMv7 build environment
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build OpenCE for Raspberry Pi ARMv7
         run: |
           mkdir -p "$GITHUB_WORKSPACE/out"
-          docker run --rm \
+          docker run --rm --platform linux/arm/v7 \
             -v "$GITHUB_WORKSPACE/out:/out" \
             -v "$GITHUB_WORKSPACE/tools/opence_rpi_patch.py:/opence_rpi_patch.py:ro" \
-            arm64v8/debian:bookworm-slim /bin/bash -euxo pipefail -c '
+            arm32v7/debian:bookworm-slim /bin/bash -euxo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
               apt-get install -y --no-install-recommends \
@@ -47,30 +52,58 @@ jobs:
               python3 configure.py --release --pgo=off --lto=off --linux-cc=clang
               ninja -v linux
 
-              mkdir -p /out/OpenCE-RaspberryPi-aarch64
-              cp build/linux/halo build/linux/brokers.txt build/linux/map_validate /out/OpenCE-RaspberryPi-aarch64/
-              cp port/linux/README.md README.md /out/OpenCE-RaspberryPi-aarch64/
-              cp /usr/local/lib/libSDL3.so.0 /out/OpenCE-RaspberryPi-aarch64/
+              mkdir -p /out/OpenCE-RaspberryPi-armhf/lib
+              cp build/linux/halo build/linux/brokers.txt build/linux/map_validate /out/OpenCE-RaspberryPi-armhf/
+              cp port/linux/README.md README.md /out/OpenCE-RaspberryPi-armhf/
+              cp /usr/local/lib/libSDL3.so.0 /out/OpenCE-RaspberryPi-armhf/lib/
+
+              cat > /out/OpenCE-RaspberryPi-armhf/run-halo.sh <<"EOF"
+          #!/bin/sh
+          HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$HERE/halo" "$@"
+          EOF
+              chmod +x /out/OpenCE-RaspberryPi-armhf/run-halo.sh
+
+              cat > /out/OpenCE-RaspberryPi-armhf/install-runtime-pi64.sh <<"EOF"
+          #!/bin/sh
+          set -eu
+          sudo dpkg --add-architecture armhf
+          sudo apt-get update
+          sudo apt-get install -y \
+            libc6:armhf libgcc-s1:armhf libstdc++6:armhf \
+            libx11-6:armhf libxext6:armhf libxcursor1:armhf libxi6:armhf \
+            libxrandr2:armhf libxfixes3:armhf libxrender1:armhf libxss1:armhf \
+            libwayland-client0:armhf libwayland-cursor0:armhf libxkbcommon0:armhf \
+            libdecor-0-0:armhf libegl1:armhf libgles2:armhf libgl1:armhf \
+            libasound2:armhf libpulse0:armhf libdbus-1-3:armhf libudev1:armhf
+          echo "ARMHF runtime installed. Start OpenCE with ./run-halo.sh"
+          EOF
+              chmod +x /out/OpenCE-RaspberryPi-armhf/install-runtime-pi64.sh
+
               printf "%s\n" \
                 "OpenCE Raspberry Pi build" \
-                "Target: Raspberry Pi OS 64-bit (AArch64), Cortex-A53" \
-                "Build userspace: Debian 12 arm64 (native ARM64 runner)" \
-                "Renderer: OpenGL ES" \
+                "Target: native ARMv7 hard-float (armhf), tuned for Cortex-A53 / Raspberry Pi 3" \
+                "Host OS: Raspberry Pi OS 64-bit is supported through the kernel ARM32 compatibility layer." \
+                "Runtime emulation: none." \
+                "Renderer: OpenGL ES path enabled." \
+                "On Pi OS 64-bit run ./install-runtime-pi64.sh once, then ./run-halo.sh." \
                 "Game data/maps are not redistributed; supply your own as OpenCE documents." \
-                > /out/OpenCE-RaspberryPi-aarch64/RASPBERRY-PI.txt
+                > /out/OpenCE-RaspberryPi-armhf/RASPBERRY-PI.txt
 
-              file build/linux/halo | tee /out/OpenCE-RaspberryPi-aarch64/BUILD-VALIDATION.txt
-              readelf -h build/linux/halo | tee -a /out/OpenCE-RaspberryPi-aarch64/BUILD-VALIDATION.txt
-              ldd build/linux/halo | tee -a /out/OpenCE-RaspberryPi-aarch64/BUILD-VALIDATION.txt
-              readelf -h build/linux/halo | grep -q "Machine:.*AArch64"
+              file build/linux/halo | tee /out/OpenCE-RaspberryPi-armhf/BUILD-VALIDATION.txt
+              readelf -h build/linux/halo | tee -a /out/OpenCE-RaspberryPi-armhf/BUILD-VALIDATION.txt
+              ldd build/linux/halo | tee -a /out/OpenCE-RaspberryPi-armhf/BUILD-VALIDATION.txt
+              readelf -h build/linux/halo | grep -q "Machine:.*ARM"
+              file build/linux/halo | grep -q "32-bit"
               cd /out
-              zip -qr OpenCE-RaspberryPi-aarch64.zip OpenCE-RaspberryPi-aarch64
+              zip -qr OpenCE-RaspberryPi-armhf.zip OpenCE-RaspberryPi-armhf
             '
 
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: OpenCE-RaspberryPi-aarch64
-          path: out/OpenCE-RaspberryPi-aarch64.zip
+          name: OpenCE-RaspberryPi-armhf
+          path: out/OpenCE-RaspberryPi-armhf.zip
           if-no-files-found: error
           retention-days: 7
