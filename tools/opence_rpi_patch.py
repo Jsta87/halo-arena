@@ -41,3 +41,15 @@ if needle not in s:
 s = s.replace(needle, needle + '    "-DHALO_GLES=1",\n', 1)
 
 p.write_text(s, encoding="utf-8")
+
+# The Linux prefix currently rejects every target except i386. The actual
+# invariant required by the original game ABI is 32-bit pointers. ARMHF has
+# 32-bit pointers too, so keep the safety check while admitting native ARM.
+prefix = Path("port/linux/include/halo_linux_prefix.h")
+s = prefix.read_text(encoding="utf-8")
+old = """#if !defined(__i386__) && !defined(HALO_ARM64_GUEST)\n#error the Linux port targets 32-bit x86: game data structures assume 32-bit pointers\n#endif\n"""
+new = """#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ != 4 && !defined(HALO_ARM64_GUEST)\n#error the Linux port requires 32-bit pointers: game data structures assume 32-bit pointers\n#endif\n"""
+if old not in s:
+    raise SystemExit("Linux architecture guard changed upstream")
+s = s.replace(old, new, 1)
+prefix.write_text(s, encoding="utf-8")
