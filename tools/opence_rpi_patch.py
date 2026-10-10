@@ -4,7 +4,8 @@ from pathlib import Path
 p = Path("tools/linux_build.py")
 s = p.read_text(encoding="utf-8")
 
-# Native Raspberry Pi OS armhf keeps the game's required 32-bit pointer ABI.
+# The upstream Linux port is hard-coded to i686. Build the same Linux port
+# natively for Raspberry Pi OS 64-bit / AArch64 instead.
 for old in (
     '    "--target=i686-linux-gnu",\n',
     '    "-m32",\n',
@@ -26,13 +27,13 @@ if count != 2:
     raise SystemExit(f"expected two i686 linker flag sites, found {count}")
 s = s.replace(old, '["-no-pie", "-g", *sysroot_ldflags,')
 
-# VideoCore uses the renderer's existing GLES path.
+# Raspberry Pi's Mesa stack supports GLES. The Linux renderer already contains
+# a HALO_GLES path shared with the ARM Android port.
 needle = '    "-DHALO_LINUX_PLATFORM_LAYER",\n'
 if needle not in s:
     raise SystemExit("platform define list changed upstream")
 s = s.replace(needle, needle + '    "-DHALO_GLES=1",\n', 1)
 
-# Game/XDK-facing units need the renderer selection too.
 needle = '    "-fms-extensions",\n'
 if needle not in s:
     raise SystemExit("ABI flag list changed upstream")
