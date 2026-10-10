@@ -10,20 +10,15 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable AArch64 build environment
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - name: Build OpenCE for Raspberry Pi OS 64-bit
         run: |
           mkdir -p "$GITHUB_WORKSPACE/out"
-          docker run --rm --platform linux/arm64 \
+          docker run --rm \
             -v "$GITHUB_WORKSPACE/out:/out" \
             -v "$GITHUB_WORKSPACE/tools/opence_rpi_patch.py:/opence_rpi_patch.py:ro" \
             arm64v8/debian:bookworm-slim /bin/bash -euxo pipefail -c '
@@ -40,7 +35,8 @@ jobs:
               git clone --depth 1 https://github.com/libsdl-org/SDL.git --branch release-3.4.16 /tmp/SDL
               cmake -S /tmp/SDL -B /tmp/SDL/build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
-                -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+                -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+                -DSDL_X11_XTEST=OFF
               ninja -C /tmp/SDL/build
               cmake --install /tmp/SDL/build
               ldconfig
@@ -58,6 +54,7 @@ jobs:
               printf "%s\n" \
                 "OpenCE Raspberry Pi build" \
                 "Target: Raspberry Pi OS 64-bit (AArch64), Cortex-A53" \
+                "Build userspace: Debian 12 arm64 (native ARM64 runner)" \
                 "Renderer: OpenGL ES" \
                 "Game data/maps are not redistributed; supply your own as OpenCE documents." \
                 > /out/OpenCE-RaspberryPi-aarch64/RASPBERRY-PI.txt
