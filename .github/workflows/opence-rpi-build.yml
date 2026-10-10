@@ -25,6 +25,7 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/out"
           docker run --rm --platform linux/arm/v7 \
             -v "$GITHUB_WORKSPACE/out:/out" \
+            -v "$GITHUB_WORKSPACE/tools/opence_rpi_patch.py:/opence_rpi_patch.py:ro" \
             arm32v7/debian:bookworm-slim /bin/bash -euxo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
@@ -46,50 +47,7 @@ jobs:
 
               git clone --depth 1 https://github.com/OpenCommunityEdition/OpenCE.git /src
               cd /src
-
-              python3 - <<"PY"
-from pathlib import Path
-p = Path("tools/linux_build.py")
-s = p.read_text()
-
-# Native Raspberry Pi OS armhf keeps the games 32-bit pointer ABI while
-# using the ARM code paths already exercised by the Android build.
-for old in (
-    "    \"--target=i686-linux-gnu\",\n",
-    "    \"-m32\",\n",
-    "    \"-malign-double\",\n",
-    "    \"-freg-struct-return\",\n",
-):
-    if old not in s:
-        raise SystemExit(f"expected Linux ABI flag not found: {old!r}")
-    s = s.replace(old, "")
-
-old = "return \"-march=x86-64\" if getattr(sln, \"port_portable\", False) else \"-march=native\""
-if old not in s:
-    raise SystemExit("march_flag implementation changed upstream")
-s = s.replace(old, "return \"-mcpu=cortex-a53\"")
-
-old = "[\"--target=i686-linux-gnu\", \"-m32\", \"-no-pie\", \"-g\", *sysroot_ldflags,"
-count = s.count(old)
-if count != 2:
-    raise SystemExit(f"expected two i686 linker flag sites, found {count}")
-s = s.replace(old, "[\"-no-pie\", \"-g\", *sysroot_ldflags,")
-
-# Pi 3-class VideoCore exposes GLES rather than the desktop GL 4.5 path.
-needle = "    \"-DHALO_LINUX_PLATFORM_LAYER\",\n"
-if needle not in s:
-    raise SystemExit("platform define list changed upstream")
-s = s.replace(needle, needle + "    \"-DHALO_GLES=1\",\n", 1)
-
-# Game/XDK-facing units need the renderer selection too.
-needle = "    \"-fms-extensions\",\n"
-if needle not in s:
-    raise SystemExit("ABI flag list changed upstream")
-s = s.replace(needle, needle + "    \"-DHALO_GLES=1\",\n", 1)
-
-p.write_text(s)
-PY
-
+              python3 /opence_rpi_patch.py
               python3 configure.py --release --pgo=off --lto=off --linux-cc=clang
               ninja -v linux
 
@@ -97,7 +55,12 @@ PY
               cp build/linux/halo build/linux/brokers.txt build/linux/map_validate /out/OpenCE-RaspberryPi-armhf/
               cp port/linux/README.md README.md /out/OpenCE-RaspberryPi-armhf/
               cp /usr/local/lib/libSDL3.so.0 /out/OpenCE-RaspberryPi-armhf/
-              printf "%s\n" "OpenCE Raspberry Pi build" "Target: Raspberry Pi OS 32-bit (armhf), Cortex-A53" "Renderer: OpenGL ES" "Game data/maps are not redistributed; supply your own as OpenCE documents." > /out/OpenCE-RaspberryPi-armhf/RASPBERRY-PI.txt
+              printf "%s\n" \
+                "OpenCE Raspberry Pi build" \
+                "Target: Raspberry Pi OS 32-bit (armhf), Cortex-A53" \
+                "Renderer: OpenGL ES" \
+                "Game data/maps are not redistributed; supply your own as OpenCE documents." \
+                > /out/OpenCE-RaspberryPi-armhf/RASPBERRY-PI.txt
 
               file build/linux/halo | tee /out/OpenCE-RaspberryPi-armhf/BUILD-VALIDATION.txt
               readelf -h build/linux/halo | tee -a /out/OpenCE-RaspberryPi-armhf/BUILD-VALIDATION.txt
