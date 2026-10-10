@@ -32,7 +32,7 @@ jobs:
               apt-get install -y --no-install-recommends \
                 ca-certificates git curl python3 clang lld llvm ninja-build cmake pkg-config \
                 build-essential file binutils zip \
-                libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
+                libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxtst-dev \
                 libxfixes-dev libxrender-dev libxss-dev libwayland-dev \
                 libxkbcommon-dev libdecor-0-dev libegl1-mesa-dev libgles2-mesa-dev \
                 libgl1-mesa-dev libasound2-dev libpulse-dev libdbus-1-dev libudev-dev
