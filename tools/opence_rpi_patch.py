@@ -4,8 +4,9 @@ from pathlib import Path
 p = Path("tools/linux_build.py")
 s = p.read_text(encoding="utf-8")
 
-# The upstream Linux port is hard-coded to i686. Build the same Linux port
-# natively for Raspberry Pi OS 64-bit / AArch64 instead.
+# OpenCE's game ABI is intentionally 32-bit (Xbox/Win32-sized long and
+# pointers). Build it as native ARM hard-float so the original data layouts
+# remain intact on Raspberry Pi, including when launched from Pi OS 64-bit.
 for old in (
     '    "--target=i686-linux-gnu",\n',
     '    "-m32",\n',
@@ -13,7 +14,7 @@ for old in (
     '    "-freg-struct-return",\n',
 ):
     if old not in s:
-        raise SystemExit(f"expected Linux ABI flag not found: {old!r}")
+        raise SystemExit(f"expected Linux x86 ABI flag not found: {old!r}")
     s = s.replace(old, "")
 
 old = 'return "-march=x86-64" if getattr(sln, "port_portable", False) else "-march=native"'
@@ -27,8 +28,8 @@ if count != 2:
     raise SystemExit(f"expected two i686 linker flag sites, found {count}")
 s = s.replace(old, '["-no-pie", "-g", *sysroot_ldflags,')
 
-# Raspberry Pi's Mesa stack supports GLES. The Linux renderer already contains
-# a HALO_GLES path shared with the ARM Android port.
+# Raspberry Pi's V3D Mesa stack is an OpenGL ES target. The Linux renderer
+# already shares a HALO_GLES path with OpenCE's ARM Android port.
 needle = '    "-DHALO_LINUX_PLATFORM_LAYER",\n'
 if needle not in s:
     raise SystemExit("platform define list changed upstream")
